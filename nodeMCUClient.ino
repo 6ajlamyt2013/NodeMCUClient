@@ -13,8 +13,8 @@
 int preferencePlants = 1;
 
 ///Network connects
-const char* ssid = "MTS_GPON_DFF3";
-const char* password = "HGPAYAtY";
+const char* ssid = "";
+const char* password = "";
 char* host = "http://192.168.1.4:8888/";
 
 ///Pin Relay
