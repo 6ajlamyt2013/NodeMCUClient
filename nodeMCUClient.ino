@@ -33,8 +33,8 @@ float temperature, humidity, pressure, uvIndex;
 int emergencyShutdown;
 
 // Настройки сети
-const char* ssid = "MTS_GPON_DFF3";
-const char* password = "HGPAYAtY";
+const char* ssid = "ssid";
+const char* password = "pwd";
 const char* serverHost = "http://www.kotikbank.ru/";
 
 // NTP клиент
