@@ -1,187 +1,246 @@
-#include <Adafruit_BME280.h>
-#include <Adafruit_VL53L0X.h>
+#include <GyverBME280.h>
 #include <Wire.h>
-#include <ArduinoJson.h>
 #include <ESP8266WiFi.h>
-#include <WiFiUdp.h>
+#include <WiFiClient.h>
 #include <ESP8266HTTPClient.h>
+#include <ArduinoJson.h>
 #include <NTPClient.h>
+#include <WiFiUdp.h>
 #include <TimeLib.h>
 
-//Client data
-#define potID  4
-int preferencePlants = 1;
+// Инициализация объектов и определений
+GyverBME280 bme;
 
-///Network connects
-const char* ssid = "";
-const char* password = "";
-char* host = "http://192.168.1.4:8888/";
+// Константы для температуры и влажности
+const float DAY_TEMP_LOW = 25.0;                   // Включение обогрева днём
+const float DAY_TEMP_HIGH = 27.0;                  // Выключение обогрева днём
+const float NIGHT_TEMP_LOW = 19.0;                 // Включение обогрева ночью
+const float NIGHT_TEMP_HIGH = 21.0;                // Выключение обогрева ночью
+const float DAY_HUMIDITY = 55.0;                   // Влажность днём
+const float NIGHT_HUMIDITY = 45.0;                 // Влажность ночью
+const int analogPin = A0;                          // Определение пина для аналогового датчика
+const int relayPins[] = { 0, 2, 14, 12, 13, 15 };  // Массив пинов реле
+const unsigned long SYNC_RETRY_INTERVAL = 60000;   // 60 seconds
+unsigned long lastSyncAttempt = 0;
 
-///Pin Relay
-#define LIGHT_PIN_RELAY 14
-#define WATER_PIN_RELAY 16
-String lightRelayState, pompRelayState;
+// Глобальная переменная для состояния обогрева
+static bool heatingState = false;
 
-///Soil Moistures
-#define  SENSOR         A0  
-#define  MIN            950                    
-#define  MAX            515                    
-uint16_t soilMoisture;   
+// Глобальные переменные для хранения значений датчиков
+float temperature, humidity, pressure, uvIndex;
 
-///BME280
-#define SEALEVELPRESSURE_HPA (989.25)
-#define BME_PIN 0x76
-Adafruit_BME280 bme;
-unsigned status, temperature, pressure, altitude, humidity;
+// Настройки сети
+const char* ssid = "ssid";
+const char* password = "password";
+const char* serverHost = "http://www.kotikbank.ru/";
 
-///Settings for get time 
-WiFiUDP udp;
-NTPClient timeClient(udp);
-int secs, h, m, s= 0;
+// NTP клиент
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000);
 
-///Laser sensor
-#define LASER_PIN       0x29
-Adafruit_VL53L0X laser = Adafruit_VL53L0X();
-VL53L0X_RangingMeasurementData_t measure;
-int waterLevel, distantce;
-
-///Local time 
-#define TIMER_PIN       0x57
-#define TIMER_DATA_PIN  0x68
-
-void setup() {  
-  //Open serial port
-  Serial.begin(9600); 
-  
-  //Pin relay
-  pinMode(LIGHT_PIN_RELAY, OUTPUT);
-  pinMode(WATER_PIN_RELAY, OUTPUT);
-  
-  //wi-fi
+void setup() {
+  // Инициализация последовательного порта для отладки
+  Serial.begin(9600);
+  // Инициализация датчика BME280
+  if (!bme.begin(0x76)) {
+    Serial.println("Ошибка инициализации датчика BME280!");
+    return;
+  }
+  // Инициализация пинов реле как выходов
+  for (int pin : relayPins) {
+    pinMode(pin, OUTPUT);
+  }
+  // Подключение к Wi-Fi сети
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    Serial.println("Connecting...");
+    Serial.println("Подключение к Wi-Fi...");
+    delay(5000);
   }
-  Serial.println("IP address: ");
+  Serial.print("IP-адрес: ");
   Serial.println(WiFi.localIP());
 
-  //Init NTP timer object
+  // Инициализация NTP клиента и синхронизация времени
   timeClient.begin();
+  timeClient.update();
+  setTime(timeClient.getEpochTime());  // Установка времени с помощью NTP
 
-  //Init wire object (i2c)
-  Wire.begin(4, 5);
-  
-  Serial.println("BME Start...");
-  if (!bme.begin(BME_PIN)) {                                                  
-    Serial.println("Could not find a valid BME280 sensor, check wiring!"); // Печать, об ошибки инициализации.
-    while (1);                                                             // Зацикливаем
-  }
-
-  Serial.println("Adafruit VL53L0X Start...");
-  if (!laser.begin(0x29)) {
-    Serial.println(F("Failed to boot VL53L0X"));
-    while(1);
-  }
+  // Установление начального состояния реле
+  digitalWrite(relayPins[0], HIGH);
+  digitalWrite(relayPins[1], LOW);
+  digitalWrite(relayPins[2], HIGH);
+  digitalWrite(relayPins[3], LOW);
+  digitalWrite(relayPins[4], HIGH);
+  digitalWrite(relayPins[5], LOW);
 }
 
 void loop() {
-  //bme 
+  if (!timeClient.update()) {
+    if (millis() - lastSyncAttempt > SYNC_RETRY_INTERVAL) {
+      timeClient.forceUpdate();
+      lastSyncAttempt = millis();
+    }
+    Serial.println("Ожидание синхронизации...");
+    delay(1000);
+    return;  // Выходим из loop, если время не синхронизировано
+  }
+
+  // Обновляем время в каждом цикле
+  setTime(timeClient.getEpochTime());
+
+  // Вывод данных на последовательный порт
+  sensorData();
+
+  // Управление реле на основе значений датчиков
+  manageRelays();
+
+  // Отправка данных на сервер
+  sendDataToServer();
+}
+
+// Функция для вывода данных датчиков
+void sensorData() {
+  // Чтение значения с аналогового датчика (предположим, UV-датчик)
+  uvIndex = analogRead(analogPin);
+
+  // Чтение данных с датчика BME280
   temperature = bme.readTemperature();
-  pressure = bme.readPressure() / 100.0F;
-  altitude = bme.readAltitude(SEALEVELPRESSURE_HPA);
   humidity = bme.readHumidity();
-  Serial.print("temperature: ");
-  Serial.println(temperature);
-  Serial.print("pressure: ");
-  Serial.println(pressure);
-  Serial.print("altitude: ");
-  Serial.println(altitude);
-  Serial.print("humidity: ");
-  Serial.println(humidity);
-  
-  //Wi-Fi
-    WiFiClient client;
-    HTTPClient http;
-  
-    String getData = ((String)"?method=updateData&pot_id=" + potID + "" + "&soil_moisture=" + soilMoisture + "&temperature=" + temperature + "&pressure=" + pressure + "&altitude=" + altitude + "&humidity=" + humidity + "&water_level=" + waterLevel + "&light_relay=" + lightRelayState + "&pomp_relay=" + pompRelayState);
-    String request = host + getData;
-    http.begin(client, request); 
-    if (int httpCode = http.GET() != 200) {
-      Serial.println("httpCode: " + httpCode);
-    } 
-    Serial.println(request);
-    String json = http.getString();
-    
-    StaticJsonDocument<500> doc;
-    DeserializationError error = deserializeJson(doc, json);
-    int settingSoilMoisture = doc["settingSoilMoisture"];
-    String settingTimeOn = doc["settingTimeOn"];
-    String settingTimeOff = doc["settingTimeOff"];
-    Serial.println(json);
-    
-    getSoilMoisture();
-    Serial.print("Current soil moistures: ");
-    Serial.println(soilMoisture);
-    
-    gitWaterLevel();
-    Serial.print("Distance to bottom (mm): ");
-    Serial.println(waterLevel);
-    
-    lightTimerLogic(settingTimeOn, settingTimeOff);
-    Serial.println("Return to main, lightRelayState: " + lightRelayState);
-    
-    pump(soilMoisture,  settingSoilMoisture);
-    Serial.println("Return to main, pompRelayState: " + pompRelayState);
+  pressure = bme.readPressure() / 100.0;
+  // Проверка диапазонов (пример, реальные диапазоны зависят от конкретных датчиков)
+  if (temperature < -50 || temperature > 100 || humidity < 0 || humidity > 100 || pressure < 300 || pressure > 1100 || uvIndex < 0) {
+    Serial.println("Ошибка чтения сенсоров!");
+  }
 
-    http.end();  
-    delay(10000); 
+  Serial.print("Температура: ");
+  Serial.print(temperature);
+  Serial.println(" °C");
+
+  Serial.print("Влажность: ");
+  Serial.print(humidity);
+  Serial.println(" %");
+
+  Serial.print("Давление: ");
+  Serial.print(pressure);
+  Serial.println(" hPa");
+
+  Serial.print("Индекс UV: ");
+  Serial.println(uvIndex);
+  Serial.println();
 }
 
-int gitWaterLevel() {
-  ///Laser sensor VL53L0X
-  laser.rangingTest(&measure, false); // pass in 'true' to get debug data printout!
-  return waterLevel = measure.RangeMilliMeter;
+void manageRelays() {
+  // Получаем текущий час и минуту
+  int currentHour = hour();
+  int currentMinute = minute();
+
+  // Проверяем день или ночь (7:00 - 23:00)
+  bool isDay = (currentHour > 7 || (currentHour == 7 && currentMinute >= 0)) && 
+               (currentHour < 23 || (currentHour == 23 && currentMinute < 60));
+
+  // Определяем пороги для текущего времени суток
+  float tempLowThreshold = isDay ? DAY_TEMP_LOW : NIGHT_TEMP_LOW;
+  float tempHighThreshold = isDay ? DAY_TEMP_HIGH : NIGHT_TEMP_HIGH;
+
+  // Обновляем состояние обогрева с использованием гистерезиса
+  heatingState = !heatingState ? (temperature < tempLowThreshold) : 
+                                (temperature <= tempHighThreshold);
+
+  // Определяем необходимость увлажнения
+  bool humidifying = humidity < (isDay ? DAY_HUMIDITY : NIGHT_HUMIDITY);
+
+  // Проверка критической температуры
+  turnOffAllRelays();
+
+  // Управление реле
+  controlRelayPair(relayPins[4], relayPins[5], isDay, "Управление светом", "Реле 4 и 5");
+  controlRelayPair(relayPins[0], relayPins[1], heatingState, "Управление обогревом", "Реле 0 и 1");
+  controlRelayPair(relayPins[2], relayPins[3], humidifying, "Управление увлажнителем", "Реле 2 и 3");
 }
 
-int getSoilMoisture() {
-//Soil Moistures
-  soilMoisture = analogRead(SENSOR);                                          
-  return soilMoisture = map(soilMoisture, MIN, MAX, 0, 100);                        
- }
+// Функция для управления парой реле
+void controlRelayPair(int pin1, int pin2, bool state, const char* reason, const char* relayName) {
+  // Попытка включить/выключить первое реле
+  digitalWrite(pin1, state);
+  delay(100);  // Небольшая задержка для стабилизации
 
-int converterDataTime (String dataTime) {
-  //Conerting to sec
-  if (sscanf(dataTime.c_str(), "%d:%d:%d", &h, &m, &s) >= 2) {
-    int secs = h *3600 + m*60 + s;
-    Serial.println("Data time: " + dataTime + " in seconds " +  secs);
-    return secs; 
-  } 
-}
-
-String lightTimerLogic(String settingTimeOn, String settingTimeOff) {
-  // Get current time HH:MM:SS
-  timeClient.update();
-  String currentTimeHHMMSS = timeClient.getFormattedTime();
-      
-  if (converterDataTime(settingTimeOn) < converterDataTime(currentTimeHHMMSS) < converterDataTime(settingTimeOff)) { 
-    digitalWrite(LIGHT_PIN_RELAY,HIGH);
-    lightRelayState = "On";
+  // Проверка состояния первого реле
+  if (digitalRead(pin1) == state) {
+    Serial.print(reason);
+    Serial.print(" для ");
+    Serial.print(relayName);
+    Serial.println(state ? " включено" : " отключено");
   } else {
-    digitalWrite(LIGHT_PIN_RELAY,LOW);
-    lightRelayState = "Off";
+    // Если первое реле не удалось включить/выключить, работаем с запасным реле
+    digitalWrite(pin2, state);
+    delay(100);  // Небольшая задержка для стабилизации
+
+    if (digitalRead(pin2) == state) {
+      Serial.print(reason);
+      Serial.print(" для запасного ");
+      Serial.print(relayName);
+      Serial.println(state ? " включено" : " отключено");
+    } else {
+      Serial.print("Не удалось ");
+      Serial.print(state ? "включить" : "отключить");
+      Serial.print(" ни основное, ни запасное ");
+      Serial.print(relayName);
+      Serial.println("!");
+    }
   }
-  return lightRelayState;
 }
 
-String pump( int soilMoisture, int settingSoilMoisture ) {
-  if(soilMoisture < settingSoilMoisture  || soilMoisture > 60000) {                   
-    digitalWrite(WATER_PIN_RELAY,HIGH);
-    pompRelayState = "On";
-  } else if (soilMoisture > settingSoilMoisture) {
-    digitalWrite(WATER_PIN_RELAY,LOW);
-    pompRelayState = "Off";
+// Функция для отключения всех реле
+void turnOffAllRelays() {
+  if (temperature >= 38 || temperature <= 5) {
+    for (int pin : relayPins) {
+      digitalWrite(pin, LOW);
+    }
+    Serial.println("Критическая температура! Все реле отключены.");
+    return;
   }
-  
-  return pompRelayState;
+}
+
+// Функция для отправки данных на сервер
+void sendDataToServer() {
+  // Формирование запроса к серверу
+  String params = String(
+    "?method=GAoYgAQyEggEEC4YChjHARixAxjRA&rele1=" + String(digitalRead(relayPins[0]) == HIGH) + "&rele2=" + String(digitalRead(relayPins[1]) == HIGH) + "&rele3=" + String(digitalRead(relayPins[2]) == HIGH) + "&rele4=" + String(digitalRead(relayPins[3]) == HIGH) + "&rele5=" + String(digitalRead(relayPins[4]) == HIGH) + "&rele6=" + String(digitalRead(relayPins[5]) == HIGH) + "&temperature=" + String(temperature) + "&pressure=" + String(pressure) + "&humidity=" + String(humidity) + "&uv_index=" + String(uvIndex));
+
+  // Отправка данных на сервер
+  WiFiClient client;
+  HTTPClient http;
+  String url = serverHost + params;
+  http.begin(client, url);
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String response = http.getString();
+    Serial.println("Ответ сервера: " + response);
+
+    // Парсинг JSON
+    DynamicJsonDocument jsonDoc(2048);
+    DeserializationError error = deserializeJson(jsonDoc, response);
+
+    if (!error) {
+      // Обработка параметров
+      unsigned long unixTime = jsonDoc["time"].as<int>();
+      int emergencyShutdown = jsonDoc["emergencyShutdown"].as<int>();
+
+      if (emergencyShutdown == 1) {
+        turnOffAllRelays();
+        Serial.println("Ручное аварийное отключение реле!");
+      } else if (emergencyShutdown == 0) {
+        Serial.println("Нормальная работа, ничего не делаем.");
+      } else {
+        Serial.println("Некорректное значение emergencyShutdown!");
+      }
+    } else {
+      Serial.print("Ошибка парсинга JSON: ");
+      Serial.println(error.f_str());
+    }
+  } else {
+    Serial.println("httpCode: " + String(httpCode));
+  }
+
+  Serial.println(url);
+  http.end();
 }
