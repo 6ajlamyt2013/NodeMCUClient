@@ -29,9 +29,12 @@ static bool heatingState = false;
 // Глобальные переменные для хранения значений датчиков
 float temperature, humidity, pressure, uvIndex;
 
+// Глобальная переменная для принудитеьного отключения всех реле, параметр приходи от сервера
+int emergencyShutdown;
+
 // Настройки сети
-const char* ssid = "ssid";
-const char* password = "password";
+const char* ssid = "MTS_GPON_DFF3";
+const char* password = "HGPAYAtY";
 const char* serverHost = "http://www.kotikbank.ru/";
 
 // NTP клиент
@@ -90,11 +93,11 @@ void loop() {
   // Вывод данных на последовательный порт
   sensorData();
 
-  // Управление реле на основе значений датчиков
-  manageRelays();
-
   // Отправка данных на сервер
   sendDataToServer();
+
+  // Управление реле на основе значений датчиков
+  manageRelays();
 }
 
 // Функция для вывода данных датчиков
@@ -128,27 +131,61 @@ void sensorData() {
   Serial.println();
 }
 
+// Функция для отправки данных на сервер
+void sendDataToServer() {
+  // Формирование запроса к серверу
+  String params = String(
+    "?method=GAoYgAQyEggEEC4YChjHARixAxjRA&rele1=" + String(digitalRead(relayPins[0]) == HIGH) + "&rele2=" + String(digitalRead(relayPins[1]) == HIGH) + "&rele3=" + String(digitalRead(relayPins[2]) == HIGH) + "&rele4=" + String(digitalRead(relayPins[3]) == HIGH) + "&rele5=" + String(digitalRead(relayPins[4]) == HIGH) + "&rele6=" + String(digitalRead(relayPins[5]) == HIGH) + "&temperature=" + String(temperature) + "&pressure=" + String(pressure) + "&humidity=" + String(humidity) + "&uv_index=" + String(uvIndex));
+
+  // Отправка данных на сервер
+  WiFiClient client;
+  HTTPClient http;
+  String url = serverHost + params;
+  http.begin(client, url);
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String response = http.getString();
+    Serial.println("Ответ сервера: " + response);
+
+    // Парсинг JSON
+    DynamicJsonDocument jsonDoc(2048);
+    DeserializationError error = deserializeJson(jsonDoc, response);
+
+    if (!error) {
+      // Обработка параметров
+      unsigned long unixTime = jsonDoc["time"].as<int>();
+      emergencyShutdown = jsonDoc["emergencyShutdown"].as<int>();
+    } else {
+      Serial.print("Ошибка парсинга JSON: ");
+      Serial.println(error.f_str());
+    }
+  } else {
+    Serial.println("httpCode: " + String(httpCode));
+  }
+
+  Serial.println(url);
+  http.end();
+}
+
 void manageRelays() {
   // Получаем текущий час и минуту
   int currentHour = hour();
   int currentMinute = minute();
 
   // Проверяем день или ночь (7:00 - 23:00)
-  bool isDay = (currentHour > 7 || (currentHour == 7 && currentMinute >= 0)) && 
-               (currentHour < 23 || (currentHour == 23 && currentMinute < 60));
+  bool isDay = (currentHour > 7 || (currentHour == 7 && currentMinute >= 0)) && (currentHour < 23 || (currentHour == 23 && currentMinute < 60));
 
   // Определяем пороги для текущего времени суток
   float tempLowThreshold = isDay ? DAY_TEMP_LOW : NIGHT_TEMP_LOW;
   float tempHighThreshold = isDay ? DAY_TEMP_HIGH : NIGHT_TEMP_HIGH;
 
   // Обновляем состояние обогрева с использованием гистерезиса
-  heatingState = !heatingState ? (temperature < tempLowThreshold) : 
-                                (temperature <= tempHighThreshold);
+  heatingState = !heatingState ? (temperature < tempLowThreshold) : (temperature <= tempHighThreshold);
 
   // Определяем необходимость увлажнения
   bool humidifying = humidity < (isDay ? DAY_HUMIDITY : NIGHT_HUMIDITY);
 
-  // Проверка критической температуры
+  // Проверка критической температуры и триггер принудительного откючения всех реле
   turnOffAllRelays();
 
   // Управление реле
@@ -197,50 +234,11 @@ void turnOffAllRelays() {
     }
     Serial.println("Критическая температура! Все реле отключены.");
     return;
-  }
-}
-
-// Функция для отправки данных на сервер
-void sendDataToServer() {
-  // Формирование запроса к серверу
-  String params = String(
-    "?method=GAoYgAQyEggEEC4YChjHARixAxjRA&rele1=" + String(digitalRead(relayPins[0]) == HIGH) + "&rele2=" + String(digitalRead(relayPins[1]) == HIGH) + "&rele3=" + String(digitalRead(relayPins[2]) == HIGH) + "&rele4=" + String(digitalRead(relayPins[3]) == HIGH) + "&rele5=" + String(digitalRead(relayPins[4]) == HIGH) + "&rele6=" + String(digitalRead(relayPins[5]) == HIGH) + "&temperature=" + String(temperature) + "&pressure=" + String(pressure) + "&humidity=" + String(humidity) + "&uv_index=" + String(uvIndex));
-
-  // Отправка данных на сервер
-  WiFiClient client;
-  HTTPClient http;
-  String url = serverHost + params;
-  http.begin(client, url);
-  int httpCode = http.GET();
-  if (httpCode == 200) {
-    String response = http.getString();
-    Serial.println("Ответ сервера: " + response);
-
-    // Парсинг JSON
-    DynamicJsonDocument jsonDoc(2048);
-    DeserializationError error = deserializeJson(jsonDoc, response);
-
-    if (!error) {
-      // Обработка параметров
-      unsigned long unixTime = jsonDoc["time"].as<int>();
-      int emergencyShutdown = jsonDoc["emergencyShutdown"].as<int>();
-
-      if (emergencyShutdown == 1) {
-        turnOffAllRelays();
-        Serial.println("Ручное аварийное отключение реле!");
-      } else if (emergencyShutdown == 0) {
-        Serial.println("Нормальная работа, ничего не делаем.");
-      } else {
-        Serial.println("Некорректное значение emergencyShutdown!");
-      }
-    } else {
-      Serial.print("Ошибка парсинга JSON: ");
-      Serial.println(error.f_str());
+  } else if (emergencyShutdown == 1) {
+    for (int pin : relayPins) {
+      digitalWrite(pin, LOW);
     }
-  } else {
-    Serial.println("httpCode: " + String(httpCode));
+    Serial.println("Ручное аварийное отключение реле!");
+    return;
   }
-
-  Serial.println(url);
-  http.end();
 }
